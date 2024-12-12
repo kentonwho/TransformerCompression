@@ -31,6 +31,17 @@ def slice_attention_inputs(layer_adapter: LayerAdapter, new_embedding_dimension:
 
     layer_adapter.layer.attn_shortcut_Q = nn.Parameter(layer_adapter.layer.attn_shortcut_Q[:new_embedding_dimension, :])
 
+def project_attention_inputs(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
+    # Project the WQ, WK and WV matrices of the self-attention layer.
+    new_embedding_dimension = Q.shape[1]
+    for W in layer_adapter.get_attention_inputs():
+        dtype = W.weight.dtype
+        W_ = W.weight.to(device=config.device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        W.in_features = new_embedding_dimension
+    
+    layer_adapter.layer.attn_shortcut_Q = nn.Parameter(layer_adapter.layer.attn_shortcut_Q[:new_embedding_dimension, :])
+
 
 def rotate_attention_output(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
     # Rotate output matrix of the self-attention layer.
@@ -52,6 +63,18 @@ def slice_attention_output(layer_adapter: LayerAdapter, new_embedding_dimension:
         W.bias.data = W.bias.data[:new_embedding_dimension]
     W.out_features = new_embedding_dimension
 
+def project_attention_output(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
+    # Project output matrix of the self-attention layer.
+    new_embedding_dimension = Q.shape[1]
+    W = layer_adapter.get_attention_output()
+
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=config.device, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=config.device, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+    W.out_features = new_embedding_dimension
 
 def rotate_mlp_input(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
     # Rotate the MLP input weights.
@@ -65,6 +88,15 @@ def slice_mlp_input(layer_adapter: LayerAdapter, new_embedding_dimension: int) -
     # Slice the MLP input weights.
     for W in layer_adapter.get_mlp_inputs():
         W.weight.data = W.weight.data[:, :new_embedding_dimension]
+        W.in_features = new_embedding_dimension
+
+def project_mlp_input(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
+    # Project the MLP input weights.
+    new_embedding_dimension = Q.shape[1]
+    for W in layer_adapter.get_mlp_inputs():
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=config.device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
         W.in_features = new_embedding_dimension
 
 
@@ -87,6 +119,18 @@ def slice_mlp_output(layer_adapter: LayerAdapter, new_embedding_dimension: int) 
         W.bias.data = W.bias.data[:new_embedding_dimension]
     W.out_features = new_embedding_dimension
 
+def project_mlp_output(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
+    # Project the MLP output weights and bias.
+    new_embedding_dimension = Q.shape[1]
+    W = layer_adapter.get_mlp_output()
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=config.device, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=config.device, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+    W.out_features = new_embedding_dimension
+
 
 def rotate_embeddings(model_adapter: ModelAdapter, Q: torch.Tensor) -> None:
     # Rotate the embeddings.
@@ -105,6 +149,13 @@ def slice_embeddings(model_adapter: ModelAdapter, new_embedding_dimensions: dict
         W.weight.data = W.weight.data[:, : new_embedding_dimensions[i]]
         W.embedding_dim = new_embedding_dimensions[i]
 
+def project_embeddings(model_adapter: ModelAdapter, Q: torch.Tensor, new_embedding_dimensions: dict[int,int]) -> None:
+    # Project the embeddings.
+    for i, W in enumerate(model_adapter.get_embeddings()):
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=config.device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+        W.embedding_dim = new_embedding_dimensions[i]
 
 def rotate_head(model_adapter: ModelAdapter, Q: torch.Tensor) -> None:
     # Rotate the head.
@@ -120,6 +171,12 @@ def slice_head(model_adapter: ModelAdapter, new_embedding_dimension: int) -> Non
     lm_head.weight.data = lm_head.weight.data[:, :new_embedding_dimension]
     lm_head.in_features = new_embedding_dimension
 
+def project_head(model_adapter: ModelAdapter, Q: torch.Tensor) -> None:
+    # Project the head.
+    lm_head = model_adapter.get_lm_head()
+    dtype = lm_head.weight.data.dtype
+    W_ = lm_head.weight.data.to(device=config.device, dtype=torch.float64)
+    lm_head.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
 def rotate_and_slice(
     model_adapter: ModelAdapter,
@@ -167,6 +224,8 @@ def rotate_and_slice_sequential(
 
     # rotate and slice embeddings
     eig_val, Q = pca_calc(inps, ignore_masks)
+    _,_,Vh = torch.linalg.svd(inps)
+    Q = Vh.T
     Q = Q.to(device=config.device)
     if final_orientation == 'random':
         R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0])
@@ -473,7 +532,7 @@ def slice_rotated_model(model_adapter: ModelAdapter, slicing_scheduler: SlicingS
         else:  # sequential case
             layer.attn_shortcut_Q = nn.Parameter(
                 layer.attn_shortcut_Q[:, : slicing_scheduler.get_attention_output_dimension(i, match_head_dim=False)]
-            )
+            ) 
             layer.mlp_shortcut_Q = nn.Parameter(
                 layer.mlp_shortcut_Q[:, : slicing_scheduler.get_mlp_output_dimension(i)]
             )
@@ -526,3 +585,5 @@ def pca_calc(
     eig_val = X_eig[0][index]
     eigen_vec = X_eig[1][:, index]
     return eig_val, eigen_vec
+
+def 
